@@ -65,13 +65,16 @@ export const ToolCallHandler = {
   /**
    * Ensure an arguments string is valid JSON per OpenAI spec.
    * - Empty -> "{}"
-   * - Already an object/array -> returned as-is
+   * - Valid JSON object/array -> returned as-is; malformed JSON throws
    * - Plain string -> wrapped as `{"value":"…"}` so consumers can always JSON-parse it.
    */
   ensureJSONArguments(s: string): string {
     const trimmed = s.trim();
     if (trimmed === "") return "{}";
-    if (trimmed.startsWith("{") || trimmed.startsWith("[")) return s;
+    if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+      JSON.parse(trimmed);
+      return s;
+    }
     return JSON.stringify({ value: trimmed });
   },
 
@@ -228,14 +231,13 @@ function parseToolCallJSON(json: string): ParsedToolCall[] | null {
   }
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
   const obj = parsed as Record<string, unknown>;
-  const raw = obj.tool_calls;
-  if (!Array.isArray(raw) || raw.length === 0) return null;
+  const raw = Array.isArray(obj.tool_calls) ? obj.tool_calls : [obj.tool_calls];
+  if (raw.length === 0) return null;
 
   const result: ParsedToolCall[] = [];
   for (const call of raw) {
-    if (!call || typeof call !== "object") continue;
+    if (!call || typeof call !== "object" || Array.isArray(call)) return null;
     const c = call as Record<string, unknown>;
-    if (typeof c.id !== "string") continue;
 
     let name: string | null = null;
     let rawArguments: unknown;
@@ -250,22 +252,29 @@ function parseToolCallJSON(json: string): ParsedToolCall[] | null {
       // Upstream-fix shape: `{"function": "name", "arguments": "..."}`
       name = fn;
       rawArguments = c.arguments;
+    } else if (typeof c.name === "string") {
+      name = c.name;
+      rawArguments = c.arguments;
+    } else if (typeof c.type === "string" && c.type !== "function") {
+      name = c.type;
+      rawArguments = c.arguments;
     }
-    if (name == null) continue;
+    if (!name?.trim()) return null;
 
     let args: string;
-    if (typeof rawArguments === "string") {
-      args = ToolCallHandler.ensureJSONArguments(rawArguments);
-    } else if (rawArguments !== undefined) {
-      try {
+    try {
+      if (typeof rawArguments === "string") {
+        args = ToolCallHandler.ensureJSONArguments(rawArguments);
+      } else if (rawArguments !== undefined) {
         args = JSON.stringify(rawArguments);
-      } catch {
+      } else {
         args = "{}";
       }
-    } else {
-      args = "{}";
+    } catch {
+      return null;
     }
-    result.push({ id: c.id, name, argumentsString: args });
+    const id = typeof c.id === "string" && c.id.trim() ? c.id : `call_${crypto.randomUUID()}`;
+    result.push({ id, name, argumentsString: args });
   }
   return result.length === 0 ? null : result;
 }

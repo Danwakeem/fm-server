@@ -213,6 +213,61 @@ curl -N -X POST http://127.0.0.1:11434/v1/chat/completions \
   }'
 ```
 
+### Streaming tool calls
+
+Client-supplied tools are returned for the client to execute, in both streaming and
+non-streaming requests. For example:
+
+```bash
+curl -N http://127.0.0.1:11434/v1/chat/completions \
+  -H "Authorization: Bearer sk-apple-11434" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "system",
+    "stream": true,
+    "messages": [{"role": "user", "content": "Read package.json and list the available scripts."}],
+    "tools": [{"type": "function", "function": {
+      "name": "read",
+      "description": "Read a project file.",
+      "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}
+    }}]
+  }'
+```
+
+Following the [OpenAI streaming format](https://developers.openai.com/api/docs/guides/function-calling#streaming),
+tool calls arrive in `choices[0].delta.tool_calls`, each with an `index`, `id`,
+`type: "function"`, and `function: { name, arguments }`. Arguments are JSON strings.
+The final choice has `finish_reason: "tool_calls"`, followed by `data: [DONE]`.
+To continue, append the assistant's `tool_calls` (without the stream-only `index`)
+and a `role: "tool"` message with the matching `tool_call_id` and tool result to
+the next request's `messages`. Repeat for each step of an agent workflow.
+
+This applies to both `system` and `pcc`. Tool-enabled streams buffer model output
+until generation finishes, then emit either tool calls or ordinary text. Requests
+without active tools continue streaming text incrementally. Tool calls are detected
+from generated JSON using prompt instructions, rather than native SDK tool
+invocation. Single objects, arrays, and nested OpenAI `function` objects are
+normalized; missing IDs are generated. Malformed output or calls to unavailable
+tools remain assistant text.
+
+`tool_choice: "none"` disables tool instructions and detection; `"auto"` is the
+default. `"required"` and forced function choices add prompt instructions, and
+forced choices restrict the available tool to the selected name. An unknown
+forced name returns 400. The model can still respond with text or malformed JSON,
+so required/forced selection and successful multi-step reasoning are best effort.
+Tool argument schemas are supplied in the prompt, not enforced by the server;
+clients must validate arguments before executing tools. Multi-turn history still
+uses the existing text folding and is subject to the model's context window.
+
+The protocol regression tests use fake inference, including a complete
+`read → bash → read` loop. A live on-device curl check emitted executable calls
+and accepted tool results, but also repeated calls and generated malformed output
+or an unavailable tool during multi-step attempts. Protocol compatibility alone
+does not guarantee that the model will complete an autonomous coding workflow.
+An OpenCode v2.0.26 check against the patched server executed `read` and sent tool
+results back on subsequent turns, but repeated the read and ended with malformed
+model output rather than the requested scripts summary.
+
 ### Structured output
 
 ```bash

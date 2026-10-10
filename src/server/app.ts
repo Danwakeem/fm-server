@@ -169,7 +169,37 @@ export function createApp(config: AppConfig): Hono {
       }
     }
     const resolved = ToolResolution.resolve(request.tools ?? null, mcpTools);
-    const effectiveTools = resolved.tools ?? undefined;
+    const forcedTool =
+      typeof request.tool_choice === "object" ? request.tool_choice.function.name : undefined;
+    if (
+      forcedTool !== undefined &&
+      !resolved.tools?.some((tool) => tool.function.name === forcedTool)
+    ) {
+      return c.json(
+        {
+          error: {
+            message: "tool_choice must name a supplied tool",
+            type: "invalid_request_error",
+          },
+        },
+        400,
+      );
+    }
+    const effectiveTools =
+      request.tool_choice === "none"
+        ? undefined
+        : forcedTool !== undefined
+          ? resolved.tools?.filter((tool) => tool.function.name === forcedTool)
+          : (resolved.tools ?? undefined);
+    const hasTools = effectiveTools != null && effectiveTools.length > 0;
+    const detectCalls = (content: string) => {
+      const calls = hasTools ? ToolCallHandler.detectToolCall(content) : null;
+      return calls?.every((call) =>
+        effectiveTools?.some((tool) => tool.function.name === call.name),
+      )
+        ? calls
+        : null;
+    };
 
     // Multi-turn: ContextManager folds system + history + final turn into a
     // pair of (instructions, finalPrompt) the helper-side LanguageModelSession
@@ -181,9 +211,15 @@ export function createApp(config: AppConfig): Hono {
       prepared = makeContext({
         messages: request.messages,
         tools: effectiveTools,
-        injectToolInstructions: effectiveTools != null && effectiveTools.length > 0,
+        injectToolInstructions: hasTools,
         responseFormat: request.response_format,
       });
+      if (hasTools && (forcedTool !== undefined || request.tool_choice === "required")) {
+        prepared.instructions +=
+          forcedTool !== undefined
+            ? `\n\nYou must call the function ${forcedTool}.`
+            : "\n\nYou must call at least one of the supplied functions.";
+      }
     } catch (err) {
       return c.json(
         {
@@ -231,6 +267,7 @@ export function createApp(config: AppConfig): Hono {
         let completionTokens = 0;
         let promptTokens = 0;
         let finishReason: string = FinishReason.openAIValue("stop");
+        let bufferedContent = "";
 
         try {
           // Role chunk first (OpenAI wire format).
@@ -261,6 +298,11 @@ export function createApp(config: AppConfig): Hono {
             c.req.raw.signal,
           )) {
             if (event.kind === "delta") {
+              // shortcut: tool-enabled replies wait for complete JSON, parse incrementally if latency matters.
+              if (hasTools) {
+                bufferedContent += event.text;
+                continue;
+              }
               await stream.writeSSE({
                 data: JSON.stringify({
                   id: requestId,
@@ -282,6 +324,52 @@ export function createApp(config: AppConfig): Hono {
               promptTokens = event.usage.promptTokens;
               finishReason = event.finishReason;
             }
+          }
+
+          if (hasTools) {
+            let calls = detectCalls(bufferedContent);
+            if (calls && resolved.injected && config.mcpClients) {
+              const executed = await runMcpTools(calls, config.mcpClients, debug);
+              const followup = await session.respond(
+                buildToolFollowupPrompt(promptText, executed),
+                {
+                  temperature: request.temperature,
+                  maxTokens: request.max_tokens,
+                  seed: request.seed,
+                },
+              );
+              bufferedContent = followup.content;
+              promptTokens += followup.usage.promptTokens;
+              completionTokens += followup.usage.completionTokens;
+              finishReason = followup.finishReason;
+              calls = null;
+            }
+            if (calls) finishReason = FinishReason.openAIValue("toolCalls");
+            await stream.writeSSE({
+              data: JSON.stringify({
+                id: requestId,
+                object: "chat.completion.chunk",
+                created,
+                model: modelName,
+                choices: [
+                  {
+                    index: 0,
+                    delta: calls
+                      ? {
+                          tool_calls: calls.map((call, index) => ({
+                            index,
+                            id: call.id,
+                            type: "function",
+                            function: { name: call.name, arguments: call.argumentsString },
+                          })),
+                        }
+                      : { content: cleanContent(bufferedContent) },
+                    finish_reason: null,
+                    logprobs: null,
+                  },
+                ],
+              }),
+            });
           }
 
           // Final finish chunk.
@@ -349,10 +437,7 @@ export function createApp(config: AppConfig): Hono {
       // Tool-call detection: when the model emitted the documented
       // {"tool_calls": ...} envelope, surface it as proper OpenAI
       // tool_calls on the assistant message with finish_reason=tool_calls.
-      const calls =
-        effectiveTools && effectiveTools.length > 0
-          ? ToolCallHandler.detectToolCall(result.content)
-          : null;
+      const calls = detectCalls(result.content);
 
       // MCP auto-execute: when MCP injected the tool list, we run the tool
       // ourselves and re-prompt for the final natural-language answer.
