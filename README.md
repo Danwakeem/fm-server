@@ -243,30 +243,54 @@ and a `role: "tool"` message with the matching `tool_call_id` and tool result to
 the next request's `messages`. Repeat for each step of an agent workflow.
 
 This applies to both `system` and `pcc`. Tool-enabled streams buffer model output
-until generation finishes, then emit either tool calls or ordinary text. Requests
-without active tools continue streaming text incrementally. Tool calls are detected
-from generated JSON using prompt instructions, rather than native SDK tool
-invocation. Single objects, arrays, and nested OpenAI `function` objects are
-normalized; missing IDs are generated. Malformed output or calls to unavailable
-tools remain assistant text.
+until generation finishes, then emit either validated calls or ordinary text.
+Requests without active tools continue streaming text incrementally.
 
-`tool_choice: "none"` disables tool instructions and detection; `"auto"` is the
-default. `"required"` and forced function choices add prompt instructions, and
-forced choices restrict the available tool to the selected name. An unknown
-forced name returns 400. The model can still respond with text or malformed JSON,
-so required/forced selection and successful multi-step reasoning are best effort.
-Tool argument schemas are supplied in the prompt, not enforced by the server;
-clients must validate arguments before executing tools. Multi-turn history still
-uses the existing text folding and is subject to the model's context window.
+For `system`, native guided generation constrains the response to an answer or
+up to eight calls to the supplied functions. Names and argument strings stay
+paired in nested objects; arguments are then validated against each function's
+JSON Schema. Prior user messages, assistant calls, and tool results are restored
+as native Foundation Models transcript entries rather than system instructions.
+OpenCode and other clients still execute their own tools; fm-server does not
+register native callbacks that execute client-supplied functions on the server.
 
-The protocol regression tests use fake inference, including a complete
-`read → bash → read` loop. A live on-device curl check emitted executable calls
-and accepted tool results, but also repeated calls and generated malformed output
-or an unavailable tool during multi-step attempts. Protocol compatibility alone
-does not guarantee that the model will complete an autonomous coding workflow.
-An OpenCode v2.0.26 check against the patched server executed `read` and sent tool
-results back on subsequent turns, but repeated the read and ended with malformed
-model output rather than the requested scripts summary.
+PCC retains text-based tool detection and history folding. Single objects, arrays,
+and nested OpenAI `function` objects are normalized; missing IDs are generated.
+Both paths reject unavailable functions, duplicate call IDs, malformed arguments,
+and arguments that violate the supplied schema. The schema validator supports
+JSON Schema draft-07, 2019-09, and 2020-12; `format` annotations are not enforced.
+Invalid client schemas and orphan native-history tool results return 400.
+
+An invalid tool attempt or structured decoding failure gets **one corrective
+retry** before any calls are emitted or MCP tools are executed. A second failure
+returns a `server_error`: HTTP 500 for a non-streaming request, or an SSE error
+followed by `[DONE]` after streaming headers have been sent. Invalid attempts
+aren't silently displayed as assistant text. Usage combines completed attempts;
+failed generations without usable output do not expose token counts.
+
+`tool_choice: "none"` disables tool instructions, guided generation, and
+conversion. `"auto"` is the default and permits text answers. `"required"` and
+forced choices require a valid call; forced choices restrict the supplied tool
+set to the selected function. Missing tools or an unknown forced name return 400.
+Clients must still apply their permissions and validate tool actions before
+execution. Correct names and argument shapes do not guarantee a correct action,
+a complete task, or freedom from repeated calls. The model's context window and
+output-token limit still apply to guided responses.
+
+The pinned SDK 0.1.0 needs repairs for transcript restoration, nested generation
+schemas, and aborting generation. pnpm applies the checked-in SDK patch; npm
+applies the same patch in postinstall using macOS's `/usr/bin/patch`. Install
+scripts must be enabled for npm, or run `node scripts/patch-sdk.js` explicitly.
+Release bundles vendor the already-patched SDK. No on-device subprocess inference
+backend is used.
+
+Regression tests use fake inference and mock SDK bindings, including retries,
+JSON Schema validation, cleanup, cancellation, native history, multiple calls,
+and a complete `read → bash → read` loop. Live on-device checks executed the
+three calls and returned a final answer after receiving their results; that run
+batched the calls in one response. An OpenCode v2.0.26 check also executed `read`
+and displayed the available scripts as ordinary assistant text. These are smoke
+checks, not guarantees of autonomous coding-agent performance.
 
 ### Structured output
 

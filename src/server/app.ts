@@ -13,9 +13,10 @@ import type { McpStdioClient } from "./mcp/McpClient.js";
 import { ChatCompletionRequest, type OpenAITool } from "./openai/index.js";
 import type { InferenceService } from "./sdk/InferenceService.js";
 import { makeContext } from "./session/ContextManager.js";
-import { Session } from "./session/Session.js";
+import { makeNativeTranscript } from "./session/NativeTranscript.js";
+import { Session, type SessionRespondResult } from "./session/Session.js";
 import { JSONFenceStripper } from "./tools/JSONFenceStripper.js";
-import { ToolCallHandler } from "./tools/ToolCallHandler.js";
+import { ToolCallValidator } from "./tools/ToolCallValidator.js";
 import { ChatRequestValidator } from "./validators/ChatRequestValidator.js";
 import { VERSION } from "./version.js";
 
@@ -192,20 +193,22 @@ export function createApp(config: AppConfig): Hono {
           ? resolved.tools?.filter((tool) => tool.function.name === forcedTool)
           : (resolved.tools ?? undefined);
     const hasTools = effectiveTools != null && effectiveTools.length > 0;
-    const detectCalls = (content: string) => {
-      const calls = hasTools ? ToolCallHandler.detectToolCall(content) : null;
-      return calls?.every((call) =>
-        effectiveTools?.some((tool) => tool.function.name === call.name),
-      )
-        ? calls
-        : null;
-    };
+    if (request.tool_choice === "required" && !hasTools) {
+      return c.json(
+        {
+          error: {
+            message: "tool_choice requires at least one supplied function",
+            type: "invalid_request_error",
+          },
+        },
+        400,
+      );
+    }
+    const nativeHistory = hasTools && backend === "onDevice";
+    let toolValidator: ToolCallValidator | undefined;
+    let transcript: Record<string, unknown> | undefined;
 
-    // Multi-turn: ContextManager folds system + history + final turn into a
-    // pair of (instructions, finalPrompt) the helper-side LanguageModelSession
-    // can consume. The full Transcript-API port lands when the helper grows
-    // an op for sending native entries; until then this textual flattening
-    // is the source of truth.
+    // On-device tools restore native history; other requests retain text folding.
     let prepared: ReturnType<typeof makeContext>;
     try {
       prepared = makeContext({
@@ -213,6 +216,7 @@ export function createApp(config: AppConfig): Hono {
         tools: effectiveTools,
         injectToolInstructions: hasTools,
         responseFormat: request.response_format,
+        nativeHistory,
       });
       if (hasTools && (forcedTool !== undefined || request.tool_choice === "required")) {
         prepared.instructions +=
@@ -220,6 +224,9 @@ export function createApp(config: AppConfig): Hono {
             ? `\n\nYou must call the function ${forcedTool}.`
             : "\n\nYou must call at least one of the supplied functions.";
       }
+      if (hasTools)
+        toolValidator = new ToolCallValidator(effectiveTools ?? [], request.tool_choice);
+      if (nativeHistory) transcript = makeNativeTranscript(prepared.instructions, request.messages);
     } catch (err) {
       return c.json(
         {
@@ -235,7 +242,7 @@ export function createApp(config: AppConfig): Hono {
 
     let session: Session;
     try {
-      session = await Session.open(config.inference, backend, instructions);
+      session = await Session.openForRequest(config.inference, backend, instructions, transcript);
     } catch (err) {
       const classified = AfmError.classify(err);
       return c.json(
@@ -259,6 +266,61 @@ export function createApp(config: AppConfig): Hono {
       request.response_format?.type === "json_object" ||
       request.response_format?.type === "json_schema";
     const cleanContent = (raw: string): string => (wantsJson ? JSONFenceStripper.strip(raw) : raw);
+    const options = {
+      temperature: request.temperature,
+      maxTokens: request.max_tokens,
+      seed: request.seed,
+      tools: effectiveTools,
+      requireToolCall: request.tool_choice === "required" || forcedTool !== undefined,
+    };
+
+    const completeToolTurn = async (streaming: boolean, signal: AbortSignal) => {
+      let prompt = promptText;
+      let invalid = "";
+      const usage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
+      for (let attempt = 0; attempt < 2; attempt++) {
+        signal.throwIfAborted();
+        try {
+          let result: SessionRespondResult;
+          if (streaming && attempt === 0) {
+            result = {
+              content: "",
+              finishReason: "stop",
+              usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+            };
+            for await (const event of session.stream(prompt, options, signal)) {
+              if (event.kind === "delta") result.content += event.text;
+              else {
+                result.finishReason = event.finishReason;
+                result.usage = event.usage;
+                result.toolCalls = event.toolCalls;
+              }
+            }
+          } else {
+            result = await session.respond(prompt, options, signal);
+          }
+          signal.throwIfAborted();
+          usage.promptTokens += result.usage.promptTokens;
+          usage.completionTokens += result.usage.completionTokens;
+          usage.totalTokens += result.usage.totalTokens;
+          const validation = toolValidator?.validate(result.content, result.toolCalls);
+          if (!validation?.error)
+            return { result: { ...result, usage }, calls: validation?.calls ?? null };
+          invalid = validation.error;
+          prompt = `${promptText}\n\nYour previous output:\n${result.content}\n\nInvalid tool output: ${invalid}\nUse only supplied functions with arguments matching their schemas. If the task is already answered by tool results, answer the user directly instead of inventing a formatting function. Respect tool_choice. Correct the response.`;
+        } catch (err) {
+          signal.throwIfAborted();
+          const classified = AfmError.classify(err);
+          if (classified.kind !== "decodingFailure") throw err;
+          invalid = classified.message;
+          prompt = `${promptText}\n\nYour previous response could not be decoded: ${invalid}\nCorrect the response using the requested format and valid tool arguments.`;
+        }
+      }
+      throw {
+        kind: "toolExecution",
+        message: `Invalid tool-call output after one corrective retry: ${invalid}`,
+      } satisfies AfmError;
+    };
 
     // MARK: - Streaming branch
     if (request.stream) {
@@ -267,7 +329,12 @@ export function createApp(config: AppConfig): Hono {
         let completionTokens = 0;
         let promptTokens = 0;
         let finishReason: string = FinishReason.openAIValue("stop");
-        let bufferedContent = "";
+        const abort = new AbortController();
+        stream.onAbort(() => abort.abort());
+        const cancel = () => abort.abort(c.req.raw.signal.reason);
+        c.req.raw.signal.addEventListener("abort", cancel, { once: true });
+        if (c.req.raw.signal.aborted) cancel();
+        const signal = abort.signal;
 
         try {
           // Role chunk first (OpenAI wire format).
@@ -288,47 +355,15 @@ export function createApp(config: AppConfig): Hono {
             }),
           });
 
-          for await (const event of session.stream(
-            promptText,
-            {
-              temperature: request.temperature,
-              maxTokens: request.max_tokens,
-              seed: request.seed,
-            },
-            c.req.raw.signal,
-          )) {
-            if (event.kind === "delta") {
-              // shortcut: tool-enabled replies wait for complete JSON, parse incrementally if latency matters.
-              if (hasTools) {
-                bufferedContent += event.text;
-                continue;
-              }
-              await stream.writeSSE({
-                data: JSON.stringify({
-                  id: requestId,
-                  object: "chat.completion.chunk",
-                  created,
-                  model: modelName,
-                  choices: [
-                    {
-                      index: 0,
-                      delta: { content: event.text },
-                      finish_reason: null,
-                      logprobs: null,
-                    },
-                  ],
-                }),
-              });
-            } else {
-              completionTokens = event.usage.completionTokens;
-              promptTokens = event.usage.promptTokens;
-              finishReason = event.finishReason;
-            }
-          }
-
           if (hasTools) {
-            let calls = detectCalls(bufferedContent);
+            const turn = await completeToolTurn(true, signal);
+            let calls = turn.calls;
+            let bufferedContent = turn.result.content;
+            promptTokens = turn.result.usage.promptTokens;
+            completionTokens = turn.result.usage.completionTokens;
+            finishReason = turn.result.finishReason;
             if (calls && resolved.injected && config.mcpClients) {
+              signal.throwIfAborted();
               const executed = await runMcpTools(calls, config.mcpClients, debug);
               const followup = await session.respond(
                 buildToolFollowupPrompt(promptText, executed),
@@ -370,6 +405,39 @@ export function createApp(config: AppConfig): Hono {
                 ],
               }),
             });
+          } else {
+            for await (const event of session.stream(
+              promptText,
+              {
+                temperature: request.temperature,
+                maxTokens: request.max_tokens,
+                seed: request.seed,
+              },
+              signal,
+            )) {
+              if (event.kind === "delta") {
+                await stream.writeSSE({
+                  data: JSON.stringify({
+                    id: requestId,
+                    object: "chat.completion.chunk",
+                    created,
+                    model: modelName,
+                    choices: [
+                      {
+                        index: 0,
+                        delta: { content: event.text },
+                        finish_reason: null,
+                        logprobs: null,
+                      },
+                    ],
+                  }),
+                });
+              } else {
+                completionTokens = event.usage.completionTokens;
+                promptTokens = event.usage.promptTokens;
+                finishReason = event.finishReason;
+              }
+            }
           }
 
           // Final finish chunk.
@@ -421,6 +489,7 @@ export function createApp(config: AppConfig): Hono {
           });
           await stream.writeSSE({ data: "[DONE]" });
         } finally {
+          c.req.raw.signal.removeEventListener("abort", cancel);
           await session.close();
         }
       });
@@ -428,16 +497,9 @@ export function createApp(config: AppConfig): Hono {
 
     // MARK: - Non-streaming branch
     try {
-      const result = await session.respond(promptText, {
-        temperature: request.temperature,
-        maxTokens: request.max_tokens,
-        seed: request.seed,
-      });
-
-      // Tool-call detection: when the model emitted the documented
-      // {"tool_calls": ...} envelope, surface it as proper OpenAI
-      // tool_calls on the assistant message with finish_reason=tool_calls.
-      const calls = detectCalls(result.content);
+      const { result, calls } = hasTools
+        ? await completeToolTurn(false, c.req.raw.signal)
+        : { result: await session.respond(promptText, options, c.req.raw.signal), calls: null };
 
       // MCP auto-execute: when MCP injected the tool list, we run the tool
       // ourselves and re-prompt for the final natural-language answer.

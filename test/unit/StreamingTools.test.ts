@@ -15,7 +15,9 @@ const tools: OpenAITool[] = ["read", "bash"].map((name) => ({
 const usage = { promptTokens: 10, completionTokens: 20, totalTokens: 30 };
 
 function fakeInference(outputs: string[], finishReason = "stop", error?: Error) {
-  const inputs: { instructions: string; prompt?: string }[] = [];
+  const inputs: { instructions: string; prompt?: string; transcript?: Record<string, unknown> }[] =
+    [];
+  const prompts: string[] = [];
   const release = mock(() => {});
   let current = -1;
   const inference = {
@@ -24,13 +26,24 @@ function fakeInference(outputs: string[], finishReason = "stop", error?: Error) 
       inputs.push({ instructions });
       return { release };
     },
+    async openSessionFromTranscript(transcript: {
+      transcript: { entries: { contents: { text: string }[] }[] };
+    }) {
+      inputs.push({
+        instructions: transcript.transcript.entries[0]?.contents[0]?.text ?? "",
+        transcript,
+      });
+      return { release };
+    },
     async respond(_session: unknown, prompt: string) {
+      prompts.push(prompt);
       const input = inputs.at(-1);
       if (!input) throw new Error("Session not opened");
       input.prompt = prompt;
       return { content: outputs[++current] ?? "", finishReason, usage };
     },
     async *stream(_session: unknown, prompt: string): AsyncGenerator<InferenceStreamEvent> {
+      prompts.push(prompt);
       const input = inputs.at(-1);
       if (!input) throw new Error("Session not opened");
       input.prompt = prompt;
@@ -43,7 +56,7 @@ function fakeInference(outputs: string[], finishReason = "stop", error?: Error) 
       yield { kind: "done", finishReason, usage };
     },
   } as unknown as InferenceService;
-  return { inference, inputs, release };
+  return { inference, inputs, prompts, release };
 }
 
 function request(app: ReturnType<typeof createApp>, overrides: Record<string, unknown> = {}) {
@@ -169,14 +182,14 @@ describe("Chat Completions streaming tools", () => {
     '{"tool_calls":{"name":"read","arguments":"{bad}"}}',
     '{"tool_calls":{"name":"unknown","arguments":{}}}',
   ]) {
-    test(`invalid output remains text: ${output}`, async () => {
-      const events = await chunks(await request(createApp(fakeInference([output]))));
-      expect(
-        deltas(events)
-          .map((delta) => delta.content ?? "")
-          .join(""),
-      ).toBe(output);
-      expect(events.at(-1).choices[0].finish_reason).toBe("stop");
+    test(`invalid output is retried then errors: ${output}`, async () => {
+      const fake = fakeInference([output, output]);
+      const events = await chunks(await request(createApp(fake)));
+      expect(events.at(-1).error.type).toBe("server_error");
+      expect(events.at(-1).error.message).toContain("after one corrective retry");
+      expect(deltas(events)).toEqual([{ role: "assistant" }]);
+      expect(fake.prompts).toHaveLength(2);
+      expect(fake.release).toHaveBeenCalledTimes(1);
     });
   }
 
@@ -209,7 +222,7 @@ describe("Chat Completions streaming tools", () => {
 
   test("auto accepts calls; forced choice does not surface a different tool", async () => {
     const output = '{"tool_calls":{"name":"bash","arguments":{"command":"pwd"}}}';
-    const fake = fakeInference([output, output]);
+    const fake = fakeInference([output, output, output]);
     const app = createApp(fake);
     const auto = await chunks(await request(app, { tool_choice: "auto" }));
     expect(auto.at(-1).choices[0].finish_reason).toBe("tool_calls");
@@ -218,12 +231,8 @@ describe("Chat Completions streaming tools", () => {
         tool_choice: { type: "function", function: { name: "read" } },
       }),
     );
-    expect(forced.at(-1).choices[0].finish_reason).toBe("stop");
-    expect(
-      deltas(forced)
-        .map((delta) => delta.content ?? "")
-        .join(""),
-    ).toBe(output);
+    expect(forced.at(-1).error.message).toContain("after one corrective retry");
+    expect(deltas(forced)).toEqual([{ role: "assistant" }]);
   });
 
   test("text truncation retains the backend's length finish reason", async () => {
@@ -234,7 +243,7 @@ describe("Chat Completions streaming tools", () => {
   });
 
   test("required selection adds instructions; unknown forced tool returns 400", async () => {
-    const fake = fakeInference(["Hello"]);
+    const fake = fakeInference(["Hello", '{"tool_calls":{"name":"read","arguments":{}}}']);
     const app = createApp(fake);
     await chunks(await request(app, { tool_choice: "required" }));
     expect(fake.inputs[0].instructions).toContain("must call at least one");
@@ -294,6 +303,150 @@ describe("Chat Completions streaming tools", () => {
     expect(fake.inputs).toHaveLength(0);
   });
 
+  for (const stream of [false, true]) {
+    test(`one corrective retry can recover an invented tool (stream=${stream})`, async () => {
+      const fake = fakeInference([
+        '{"tool_calls":{"function":"list","arguments":[]}}',
+        "Scripts: build, test",
+      ]);
+      const response = await request(createApp(fake), {
+        stream,
+        stream_options: { include_usage: true },
+      });
+      if (stream) {
+        const events = await chunks(response);
+        expect(
+          deltas(events)
+            .map((delta) => delta.content ?? "")
+            .join(""),
+        ).toBe("Scripts: build, test");
+        expect(events.at(-2).choices[0].finish_reason).toBe("stop");
+        expect(events.at(-1).usage.total_tokens).toBe(60);
+      } else {
+        const body = await response.json();
+        expect(body.choices[0].message.content).toBe("Scripts: build, test");
+        expect(body.usage.total_tokens).toBe(60);
+      }
+      expect(fake.prompts).toHaveLength(2);
+      expect(fake.prompts[1]).toContain("not supplied");
+      expect(fake.release).toHaveBeenCalledTimes(1);
+    });
+
+    test(`failed recovery returns an explicit error (stream=${stream})`, async () => {
+      const output = '{"tool_calls":{"name":"unknown","arguments":{}}}';
+      const fake = fakeInference([output, output]);
+      const response = await request(createApp(fake), { stream });
+      if (stream) {
+        const events = await chunks(response);
+        expect(events.at(-1).error.message).toContain("after one corrective retry");
+      } else {
+        expect(response.status).toBe(500);
+        expect((await response.json()).error.type).toBe("server_error");
+      }
+      expect(fake.prompts).toHaveLength(2);
+    });
+  }
+
+  test("native final-answer metadata preserves literal JSON text", async () => {
+    const output = '{"tool_calls": "documentation example"}';
+    const fake = fakeInference([]);
+    spyOn(fake.inference, "stream").mockImplementation(async function* () {
+      yield { kind: "delta", text: output };
+      yield { kind: "done", finishReason: "stop", usage, toolCalls: [] };
+    });
+    const events = await chunks(await request(createApp(fake)));
+    expect(events.at(-1).choices[0].finish_reason).toBe("stop");
+    expect(
+      deltas(events)
+        .map((delta) => delta.content ?? "")
+        .join(""),
+    ).toBe(output);
+  });
+
+  test("required selection without tools is rejected", async () => {
+    const fake = fakeInference([]);
+    expect((await request(createApp(fake), { tools: [], tool_choice: "required" })).status).toBe(
+      400,
+    );
+    expect(fake.inputs).toHaveLength(0);
+  });
+
+  test("native decoding failures get exactly one corrective retry", async () => {
+    const fake = fakeInference(["Scripts: build, test"]);
+    const initial = spyOn(fake.inference, "stream").mockImplementation(async function* () {
+      yield { kind: "delta", text: '{"tool_calls":' };
+      throw { kind: "decodingFailure", message: "Incomplete structured output" };
+    });
+    const events = await chunks(await request(createApp(fake)));
+    expect(events.at(-1).choices[0].finish_reason).toBe("stop");
+    expect(initial).toHaveBeenCalledTimes(1);
+    expect(fake.prompts).toHaveLength(1);
+    expect(fake.prompts[0]).toContain("Incomplete structured output");
+  });
+
+  test("schema-invalid arguments are corrected before emitting a call", async () => {
+    const fake = fakeInference([
+      '{"tool_calls":{"name":"read","arguments":{}}}',
+      '{"tool_calls":{"name":"read","arguments":{"path":"package.json"}}}',
+    ]);
+    const events = await chunks(
+      await request(createApp(fake), {
+        tools: [
+          {
+            type: "function",
+            function: {
+              name: "read",
+              parameters: {
+                type: "object",
+                required: ["path"],
+                properties: { path: { type: "string" } },
+              },
+            },
+          },
+        ],
+      }),
+    );
+    expect(events.at(-1).choices[0].finish_reason).toBe("tool_calls");
+    expect(fake.prompts[1]).toContain("do not match");
+    expect(deltas(events).flatMap((delta) => delta.tool_calls ?? [])).toHaveLength(1);
+  });
+
+  test("invalid client schemas and orphan results are rejected before opening inference", async () => {
+    const fake = fakeInference([]);
+    const app = createApp(fake);
+    expect(
+      (
+        await request(app, {
+          tools: [{ function: { name: "read", parameters: { type: "banana" } } }],
+        })
+      ).status,
+    ).toBe(400);
+    expect(
+      (
+        await request(app, {
+          messages: [{ role: "tool", tool_call_id: "missing", content: "data" }],
+        })
+      ).status,
+    ).toBe(400);
+    expect(fake.inputs).toHaveLength(0);
+  });
+
+  test("PCC recovery uses the same validator without native transcripts", async () => {
+    const first = spyOn(PccInferenceService, "stream").mockImplementation(async function* () {
+      yield { kind: "delta", text: '{"tool_calls":{"name":"invented","arguments":{}}}' };
+      yield { kind: "done", finishReason: "stop", usage };
+    });
+    const retry = spyOn(PccInferenceService, "respond").mockResolvedValue({
+      content: "Scripts: build, test",
+      finishReason: "stop",
+      usage,
+    });
+    const events = await chunks(await request(createApp(fakeInference([])), { model: "pcc" }));
+    expect(events.at(-1).choices[0].finish_reason).toBe("stop");
+    expect(first).toHaveBeenCalledTimes(1);
+    expect(retry).toHaveBeenCalledTimes(1);
+  });
+
   test("read → bash → read across requests preserves tool results and history", async () => {
     const fake = fakeInference([
       '{"tool_calls":{"name":"read","arguments":{"path":"package.json"}}}',
@@ -321,13 +474,17 @@ describe("Chat Completions streaming tools", () => {
         tool_calls: calls.map(({ index: _index, ...call }) => call),
       });
       messages.push({ role: "tool", tool_call_id: calls[0].id, content: results[index] ?? "" });
-      if (index > 0) expect(fake.inputs[index].prompt).toContain(results[index - 1] ?? "");
+      if (index > 0)
+        expect(JSON.stringify(fake.inputs[index].transcript)).toContain(
+          JSON.stringify(results[index - 1] ?? "").slice(1, -1),
+        );
     }
     const final = await chunks(await request(app, { messages }));
     expect(final.at(-1).choices[0].finish_reason).toBe("stop");
-    expect(fake.inputs[3].prompt).toContain(results[2] ?? "");
-    expect(fake.inputs[3].instructions).toContain("Assistant called tool(s): bash(");
-    expect(fake.inputs[3].instructions).toContain(results[0] ?? "");
+    expect(JSON.stringify(fake.inputs[3].transcript)).toContain(results[2] ?? "");
+    expect(JSON.stringify(fake.inputs[3].transcript)).toContain('"name":"bash"');
+    expect(fake.inputs[3].instructions).not.toContain("Conversation so far");
+    expect(JSON.stringify(fake.inputs[3].transcript)).toContain("scripts");
     expect(fake.release).toHaveBeenCalledTimes(4);
   });
 });

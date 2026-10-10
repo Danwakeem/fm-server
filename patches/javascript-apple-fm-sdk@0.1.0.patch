@@ -1,0 +1,87 @@
+--- a/dist/session.js
++++ b/dist/session.js
+@@ -56,11 +56,16 @@
+      *   `GeneratedContent` instance.
+      */
+     async respond(prompt, opts) {
++        if (opts?.signal?.aborted) throw new Error("Request aborted");
+         if (this._requestLock) {
+             throw new Error("Session already has an active request");
+         }
+         this._requestLock = true;
+         const native = getNativeBindings();
++        const onAbort = () => {
++            if (this._activeTask) native.fmTaskCancel(this._activeTask);
++        };
++        opts?.signal?.addEventListener("abort", onAbort, { once: true });
+         let composedPrompt = null;
+         try {
+             composedPrompt = composePrompt(prompt);
+@@ -78,6 +83,7 @@
+             return await this._respondText(composedPrompt, optionsJSON);
+         }
+         finally {
++            opts?.signal?.removeEventListener("abort", onAbort);
+             this._requestLock = false;
+             if (this._activeTask) {
+                 native.fmRelease(this._activeTask);
+@@ -219,8 +225,11 @@
+     }
+     /** @internal — used only by fromTranscript. */
+     static __privateFromPtr(ptr) {
+-        const session = Object.create(LanguageModelSession.prototype);
+-        ManagedObject.call(session, ptr);
++        const session = Reflect.construct(ManagedObject, [ptr], LanguageModelSession);
++        session._requestLock = false;
++        session._activeTask = null;
++        session._tools = [];
++        session._bridgedTools = [];
+         return session;
+     }
+ }
+--- a/dist/session.d.ts
++++ b/dist/session.d.ts
+@@ -18,6 +18,7 @@
+     tools?: Tool[];
+ }
+ export interface RespondOptions {
++    signal?: AbortSignal;
+     options?: GenerationOptions;
+     generating?: GenerationSchema | GenerableSchema<unknown>;
+ }
+--- a/dist/generable.js
++++ b/dist/generable.js
+@@ -11,6 +11,8 @@
+ import { getNativeBindings } from "./ffi/native.js";
+ import { GenerationSchema } from "./generation-schema.js";
+ import { getGuideMeta } from "./generation-guide.js";
++import { unwrapZodType } from "./type-conversion.js";
++import z from "zod";
+ // --- GenerationID ---
+ export class GenerationID {
+     value;
+@@ -123,6 +125,13 @@
+             description: guideMeta?.description,
+             guides: guideMeta?.constraints ?? {},
+         };
++        const field = unwrapZodType(zodType);
++        const nestedObject = field instanceof z.ZodArray ? unwrapZodType(field.element) : field;
++        if (nestedObject instanceof z.ZodObject) {
++            const nested = generable(nestedObject, `${name}_${key}`).generationSchema();
++            meta.nestedSchema = nested;
++            nestedSchemas.push(nested);
++        }
+         properties.set(key, meta);
+     }
+     // Cache the GenerationSchema (lazy)
+--- a/dist/generation-schema.js
++++ b/dist/generation-schema.js
+@@ -28,7 +28,7 @@
+                 continue;
+             const optional = isZodOptional(zodType);
+             const swiftType = meta.nestedSchema
+-                ? meta.nestedSchema.name
++                ? (isZodArray(zodType) ? `array<${meta.nestedSchema.name}>` : meta.nestedSchema.name)
+                 : zodTypeToSwiftString(zodType);
+             const propRef = native.generationSchemaPropertyCreate(propName, meta.description ?? null, swiftType, optional);
+             applyGuides(native, propRef, meta.guides, zodType);

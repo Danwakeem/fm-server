@@ -55,7 +55,8 @@ HTTP request
 
 - **HTTP:** one session per `/v1/chat/completions` request (both backends)
 - **CLI `chat`:** on-device reuses a single `LanguageModelSession` across REPL turns; PCC uses `fm-access-pcc`'s `createChatSession()`
-- Multi-turn HTTP history is folded into text by `ContextManager` (Transcript API not yet wired)
+- Tool-enabled `system` HTTP requests restore user, assistant, and tool-result history through `NativeTranscript` and the SDK Transcript API. Other HTTP requests fold history into text through `ContextManager`.
+- Tool-enabled `system` generation uses a native schema (up to eight calls per turn); PCC uses text detection. Both validate calls and arguments and allow one corrective retry.
 
 ### Streaming
 
@@ -74,6 +75,8 @@ HTTP request
 | `src/server/pcc/PccInferenceService.ts` | PCC adapter (fm-access-pcc) |
 | `src/server/session/Session.ts` | Backend-dispatching session wrapper |
 | `src/server/session/ContextManager.ts` | Message folding → instructions + prompt |
+| `src/server/session/NativeTranscript.ts` | OpenAI history → Foundation Models transcript entries |
+| `src/server/tools/ToolCallValidator.ts` | Generated tool names, IDs, arguments, and tool-choice validation |
 | `src/server/validators/ChatRequestValidator.ts` | Model/param validation |
 | `src/server/errors/AfmError.ts` | Error taxonomy + HTTP status mapping |
 | `src/cli/main.ts` | CLI entry (citty subcommands) |
@@ -117,6 +120,7 @@ CLI commands import from `../../server/index.js` (relative), not from the packag
 | `fm-access-pcc` | `https://github.com/tariqwest/fm-access-PCC/releases/download/v0.2.0/fm-access-pcc-0.2.0.tgz` |
 
 Release packaging vendors from `node_modules` (or optional path overrides).
+The pinned SDK has a repository patch for transcript construction, nested schemas, and cancellation. pnpm applies it through `patchedDependencies`; npm uses `scripts/patch-sdk.js` during postinstall. Review the patch when changing SDK versions.
 
 ## Commands
 

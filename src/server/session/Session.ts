@@ -5,19 +5,22 @@
 // ============================================================================
 
 import type { LanguageModelSession } from "javascript-apple-fm-sdk";
-import { AfmError } from "../errors/AfmError.js";
 import type { ModelBackend } from "../backend/ModelBackend.js";
-import {
-  InferenceService,
-  type InferenceRespondResult,
-  type InferenceStreamEvent,
-} from "../sdk/InferenceService.js";
+import { AfmError } from "../errors/AfmError.js";
+import type { OpenAITool } from "../openai/index.js";
 import { PccInferenceService } from "../pcc/PccInferenceService.js";
+import type {
+  InferenceRespondResult,
+  InferenceService,
+  InferenceStreamEvent,
+} from "../sdk/InferenceService.js";
 
 export interface SessionOptions {
   temperature?: number;
   maxTokens?: number;
   seed?: number;
+  tools?: OpenAITool[];
+  requireToolCall?: boolean;
 }
 
 export type SessionRespondResult = InferenceRespondResult;
@@ -30,11 +33,7 @@ export class Session {
     private readonly instructions?: string,
   ) {}
 
-  static open(
-    inference: InferenceService,
-    backend: ModelBackend,
-    instructions?: string,
-  ): Session {
+  static open(inference: InferenceService, backend: ModelBackend, instructions?: string): Session {
     if (backend === "privateCloudCompute") {
       // PCC sessions don't use the javascript-apple-fm-sdk LanguageModelSession.
       // fm-access-pcc drives fm serve / fm CLI per-call.
@@ -49,11 +48,28 @@ export class Session {
     }
   }
 
-  async respond(prompt: string, options?: SessionOptions): Promise<SessionRespondResult> {
+  static async openForRequest(
+    inference: InferenceService,
+    backend: ModelBackend,
+    instructions: string,
+    transcript?: Record<string, unknown>,
+  ): Promise<Session> {
+    if (!transcript || backend !== "onDevice")
+      return Session.open(inference, backend, instructions);
+    const sdkSession = await inference.openSessionFromTranscript(transcript);
+    return new Session(inference, sdkSession, backend, instructions);
+  }
+
+  async respond(
+    prompt: string,
+    options?: SessionOptions,
+    signal?: AbortSignal,
+  ): Promise<SessionRespondResult> {
     if (this.backend === "privateCloudCompute") {
       return PccInferenceService.respond(prompt, this.instructions, options);
     }
-    return this.inference!.respond(this.sdkSession!, prompt, options);
+    if (!this.inference || !this.sdkSession) throw new Error("On-device session is unavailable");
+    return this.inference.respond(this.sdkSession, prompt, options, signal);
   }
 
   async *stream(
@@ -65,7 +81,8 @@ export class Session {
       yield* PccInferenceService.stream(prompt, this.instructions, options, signal);
       return;
     }
-    yield* this.inference!.stream(this.sdkSession!, prompt, options, signal);
+    if (!this.inference || !this.sdkSession) throw new Error("On-device session is unavailable");
+    yield* this.inference.stream(this.sdkSession, prompt, options, signal);
   }
 
   async close(): Promise<void> {
